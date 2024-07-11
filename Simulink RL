@@ -1,0 +1,181 @@
+%% EJEMPLO DE REINFORCEMENT LEARNING
+% Sebastián, Josué, Ángel y Renato.
+% Machine Learning Lab. Trabajo Final
+
+% La idea es aplicar RL para tunear un control PI ante un problema que
+% presenta no linealidad y ruido a la salida del control.
+% Además, compararlo con el Control System Tuner a partir de su respuesta
+% step y funciones de costo acumulativas.
+
+%% Modelo
+% La meta es controlar un sistema que mantenga el nivel de agua a partir
+% de un valor de referencia H.
+
+open_system('watertankLQG')
+Ts = 0.1; Tf = 10; % tiempo de muestreo y de simulacion
+
+%% Usar Control System Tuner
+
+% controlSystemTuner("ControlSystemTunerSession")
+Kp_CST = 9.80199999804512;
+Ki_CST = 1.00019996230706e-06;
+
+%% Crear el Environment
+
+mdl = 'rlwatertankPIDTune';
+open_system(mdl)
+[env,obsInfo,actInfo] = localCreatePIDEnv(mdl);
+numObs = prod(obsInfo.Dimension);
+numAct = prod(actInfo.Dimension);
+rng(0);
+
+%% Crear el Agente TD3
+% Crear la red neuronal con el input obs y el action output.
+% Incluye un actor y un critico
+
+initialGain = single([1e-3 2]);
+actorNet = [
+    featureInputLayer(numObs)
+    fullyConnectedPILayer(initialGain,'ActOutLyr')
+    ];
+actorNet = dlnetwork(actorNet);
+actor = rlContinuousDeterministicActor(actorNet,obsInfo,actInfo);
+% analyzeNetwork(actorNet) % input layer: error integrado y error
+
+criticNet = localCreateCriticNetwork(numObs,numAct);
+critic1 = rlQValueFunction(dlnetwork(criticNet), ...
+    obsInfo,actInfo,...
+    ObservationInputNames='stateInLyr', ...
+    ActionInputNames='actionInLyr');
+
+critic2 = rlQValueFunction(dlnetwork(criticNet), ...
+    obsInfo,actInfo,...
+    ObservationInputNames='stateInLyr', ...
+    ActionInputNames='actionInLyr');
+critic = [critic1 critic2];
+% analyzeNetwork(criticNet)
+
+%% Opciones de Training para el Agente
+actorOpts = rlOptimizerOptions( ...
+    LearnRate=1e-3, ...
+    GradientThreshold=1);
+
+criticOpts = rlOptimizerOptions( ...
+    LearnRate=1e-3, ...
+    GradientThreshold=1);
+
+agentOpts = rlTD3AgentOptions(...
+    SampleTime=Ts,...
+    MiniBatchSize=128, ...
+    ExperienceBufferLength=1e6,...
+    ActorOptimizerOptions=actorOpts,...
+    CriticOptimizerOptions=criticOpts);
+
+% Añade ruido al explorar, evitar minimo local
+agentOpts.TargetPolicySmoothModel.StandardDeviation = sqrt(0.1); 
+agent = rlTD3Agent(actor,critic,agentOpts);
+
+%% Entrenar al Agente
+
+maxepisodes = 1000; % 1000
+maxsteps = ceil(Tf/Ts);
+trainOpts = rlTrainingOptions(...
+    MaxEpisodes=maxepisodes, ...
+    MaxStepsPerEpisode=maxsteps, ...
+    ScoreAveragingWindowLength=100, ... %100
+    Verbose=false, ...
+    Plots="training-progress",...
+    StopTrainingCriteria="AverageReward",...
+    StopTrainingValue=-355); % -355
+
+%trainingStats = train(agent,env,trainOpts);
+load("WaterTankPIDtd3.mat","agent") % Agente Preentrenado
+
+%% Validar al Agente Entrenado
+simOpts = rlSimulationOptions(MaxSteps=maxsteps);
+experiences = sim(env,agent,simOpts);
+actor = getActor(agent);
+parameters = getLearnableParameters(actor);
+
+Ki = abs(parameters{1}(1))
+Kp = abs(parameters{1}(2))
+
+% Actualizar parámetros del control PI
+mdlTest = 'watertankLQG';
+open_system(mdlTest); 
+set_param([mdlTest '/PID Controller'],'P',num2str(Kp))
+set_param([mdlTest '/PID Controller'],'I',num2str(Ki))
+sim(mdlTest)
+
+rlStep = simout;
+rlCost = cost;
+rlStabilityMargin = localStabilityAnalysis(mdlTest);
+
+set_param([mdlTest '/PID Controller'],'P',num2str(Kp_CST))
+set_param([mdlTest '/PID Controller'],'I',num2str(Ki_CST))
+sim(mdlTest)
+cstStep = simout;
+cstCost = cost;
+cstStabilityMargin = localStabilityAnalysis(mdlTest);
+
+%% Comparación del Desempeño del Control
+
+figure
+plot(cstStep)
+hold on
+plot(rlStep)
+grid on
+legend('Control System Tuner','RL',Location="southeast")
+title('Step Response')
+
+% Cuantificacion del Desempeño
+rlStepInfo = stepinfo(rlStep.Data,rlStep.Time);
+cstStepInfo = stepinfo(cstStep.Data,cstStep.Time);
+stepInfoTable = struct2table([cstStepInfo rlStepInfo]);
+stepInfoTable = removevars(stepInfoTable,{'SettlingMin', ...
+    'TransientTime','SettlingMax','Undershoot','PeakTime'});
+stepInfoTable.Properties.RowNames = {'CST','RL'};
+stepInfoTable
+
+% Metricas de Bode
+stabilityMarginTable = struct2table( ...
+    [cstStabilityMargin rlStabilityMargin]);
+stabilityMarginTable = removevars(stabilityMarginTable,{...
+    'GMFrequency','PMFrequency','DelayMargin','DMFrequency'});
+stabilityMarginTable.Properties.RowNames = {'CST','RL'};
+stabilityMarginTable
+
+% Comparacion del costo LQG acumulativo de los dos controladores
+rlCumulativeCost  = sum(rlCost.Data)
+cstCumulativeCost = sum(cstCost.Data)
+
+%{ 
+%% Análisis de sensibilidad de hiperparámetros
+% Ver cómo diferentes tasas de aprendizaje afectan el rendimiento del agente
+
+learnRates = [1e-4, 1e-3, 1e-2];
+numTrials = 3;
+results = cell(length(learnRates), numTrials);
+
+for i = 1:length(learnRates)
+    for j = 1:numTrials
+        % Configurar agente con tasa de aprendizaje actual
+        actorOpts.LearnRate = learnRates(i);
+        criticOpts.LearnRate = learnRates(i);
+        agent = rlTD3Agent(actor,critic,agentOpts);
+        
+        % Entrenar agente
+        trainingStats = train(agent,env,trainOpts);
+        
+        % Guardar resultados
+        results{i,j} = trainingStats.AverageReward(end);
+    end
+end
+
+% Visualizar resultados
+figure
+boxplot(cell2mat(results)', 'Labels', {'1e-4', '1e-3', '1e-2'})
+title('Efecto de la tasa de aprendizaje en la recompensa promedio')
+xlabel('Tasa de aprendizaje')
+ylabel('Recompensa promedio final')
+%}
