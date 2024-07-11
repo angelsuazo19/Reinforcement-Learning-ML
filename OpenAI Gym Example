@@ -1,0 +1,85 @@
+import gymnasium as gym
+import numpy as np
+import matplotlib.pyplot as plt
+
+def get_expert_policy(env):
+    return {s: {a: 1.0 / env.action_space.n for a in range(env.action_space.n)} for s in range(env.observation_space.n)}
+
+def get_expert_trajectories(env, policy, num_trajectories=100, max_steps=200):
+    trajectories = []
+    for _ in range(num_trajectories):
+        state, _ = env.reset()
+        trajectory = []
+        for _ in range(max_steps):
+            action = max(policy[state], key=policy[state].get)
+            next_state, reward, done, _, _ = env.step(action)
+            trajectory.append((state, action, reward))
+            if done:
+                break
+            state = next_state
+        trajectories.append(trajectory)
+    return trajectories
+
+def maximum_entropy_irl(env, expert_trajectories, learning_rate=0.01, num_iterations=100):
+    num_states = env.observation_space.n
+    num_actions = env.action_space.n
+    
+    rewards = np.random.rand(num_states)
+    
+    for _ in range(num_iterations):
+        expert_features = np.zeros(num_states)
+        for trajectory in expert_trajectories:
+            for state, _, _ in trajectory:
+                expert_features[state] += 1
+        expert_features /= len(expert_trajectories)
+        
+        policy = get_expert_policy(env)
+        
+        current_features = np.zeros(num_states)
+        trajectories = get_expert_trajectories(env, policy)
+        for trajectory in trajectories:
+            for state, _, _ in trajectory:
+                current_features[state] += 1
+        current_features /= len(trajectories)
+        
+        gradient = expert_features - current_features
+        rewards += learning_rate * gradient
+    
+    return rewards
+
+# Usar el entorno Taxi
+env = gym.make("Taxi-v3")
+
+# Obtener trayectorias del experto
+expert_policy = get_expert_policy(env)
+expert_trajectories = get_expert_trajectories(env, expert_policy)
+
+# Ejecutar IRL
+learned_rewards = maximum_entropy_irl(env, expert_trajectories)
+
+# Visualizar recompensas aprendidas
+plt.figure(figsize=(15, 5))
+
+# Subplot 1: Mapa de calor de recompensas
+plt.subplot(1, 2, 1)
+plt.imshow(learned_rewards.reshape(25, 20), cmap='hot', interpolation='nearest')
+plt.colorbar()
+plt.title("Learned Rewards Heatmap")
+plt.xlabel("State Space (Dim 2)")
+plt.ylabel("State Space (Dim 1)")
+
+# Subplot 2: Distribución de recompensas
+plt.subplot(1, 2, 2)
+plt.hist(learned_rewards, bins=50)
+plt.title("Distribution of Learned Rewards")
+plt.xlabel("Reward Value")
+plt.ylabel("Frequency")
+
+plt.tight_layout()
+plt.show()
+
+# Imprimir estadísticas de las recompensas aprendidas
+print(f"Min reward: {learned_rewards.min():.4f}")
+print(f"Max reward: {learned_rewards.max():.4f}")
+print(f"Mean reward: {learned_rewards.mean():.4f}")
+print(f"Median reward: {np.median(learned_rewards):.4f}")
